@@ -21,7 +21,18 @@ export default function Home() {
 	const [loading, setLoading] = useState(false);
 	const [currentStep, setCurrentStep] = useState<number | null>(null);
 	const [userId, setUserId] = useState<string | null>(null);
+	const [profileName, setProfileName] = useState<string | null>(null);
 	const [error, setError] = useState<string | null>(null);
+
+	// auth form state
+	const [authMode, setAuthMode] = useState<"signup" | "signin" | null>(null);
+	const [authEmail, setAuthEmail] = useState("");
+	const [authPassword, setAuthPassword] = useState("");
+	const [authName, setAuthName] = useState("");
+	const [authMobile, setAuthMobile] = useState("");
+	const [authIndustry, setAuthIndustry] = useState("");
+	const [authLoading, setAuthLoading] = useState(false);
+	const [authMessage, setAuthMessage] = useState<string | null>(null);
 
 	useEffect(() => {
 		let mounted = true;
@@ -34,12 +45,23 @@ export default function Home() {
 
 				if (!user) {
 					// no logged-in user
-					if (mounted) setUserId(null);
+					if (mounted) {
+						setUserId(null);
+						setProfileName(null);
+					}
 					setLoading(false);
 					return;
 				}
 
 				if (mounted) setUserId(user.id);
+
+				// fetch profile name for display
+				try {
+					const { data: profile } = await supabase.from("profiles").select("name").eq("user_id", user.id).maybeSingle();
+					if (mounted && profile && profile.name) setProfileName(profile.name);
+				} catch (e) {
+					console.error("failed to fetch profile name", e);
+				}
 
 				// fetch current_step from user_journey table
 				const { data, error } = await supabase
@@ -67,21 +89,93 @@ export default function Home() {
 
 		load();
 
-		// listen for auth changes (optional)
-		const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+		// listen for auth changes (ensure profile and journey rows exist)
+		const { data: listener } = supabase.auth.onAuthStateChange(async (_event, session) => {
 			if (session?.user) {
 				setUserId(session.user.id);
-				// refetch when user signs in
-				(async () => {
-					const { data, error } = await supabase
-						.from("user_journey")
-						.select("current_step")
+				// set profile name if exists
+				try {
+					const { data: profile, error: profileErr } = await supabase
+						.from("profiles")
+						.select("name")
 						.eq("user_id", session.user.id)
 						.maybeSingle();
-					if (!error && data && data.current_step != null) setCurrentStep(Number(data.current_step));
+					if (!profileErr && profile && profile.name) setProfileName(profile.name);
+				} catch (e) {
+					console.error(e);
+				}
+				// ensure profile and user_journey rows exist and fetch current_step
+				(async () => {
+					try {
+						const { data: profile, error: profileErr } = await supabase
+							.from("profiles")
+							.select("*")
+							.eq("user_id", session.user.id)
+							.maybeSingle();
+
+						if (profileErr) console.error("profile fetch error", profileErr);
+
+						// use metadata from the auth session (populated at sign up) when available
+						const metadata = (session.user as any)?.user_metadata ?? (session.user as any)?.user_metadata ?? {};
+						const metaName = metadata?.name ?? null;
+						const metaMobile = metadata?.mobile ?? null;
+						const metaIndustry = metadata?.industry ?? null;
+						const email = session.user.email ?? null;
+
+						if (!profile) {
+							// create profile row using metadata when possible
+							// include `id` populated with auth user id in case the table requires it
+							await supabase.from("profiles").upsert({
+								id: session.user.id,
+								user_id: session.user.id,
+								name: metaName,
+								mobile: metaMobile,
+								industry: metaIndustry,
+								email,
+							});
+						} else {
+							// ensure existing profile has at least a name/email; update if missing but metadata exists
+							const updates: any = { id: session.user.id, user_id: session.user.id };
+							let needsUpdate = false;
+							if ((!profile.name || profile.name === null) && metaName) {
+								updates.name = metaName;
+								needsUpdate = true;
+							}
+							if ((!profile.mobile || profile.mobile === null) && metaMobile) {
+								updates.mobile = metaMobile;
+								needsUpdate = true;
+							}
+							if ((!profile.industry || profile.industry === null) && metaIndustry) {
+								updates.industry = metaIndustry;
+								needsUpdate = true;
+							}
+							if ((!profile.email || profile.email === null) && email) {
+								updates.email = email;
+								needsUpdate = true;
+							}
+							if (needsUpdate) {
+								await supabase.from("profiles").upsert(updates);
+							}
+						}
+
+						const { data, error } = await supabase
+							.from("user_journey")
+							.select("current_step")
+							.eq("user_id", session.user.id)
+							.maybeSingle();
+						if (!error && data && data.current_step != null) setCurrentStep(Number(data.current_step));
+						else {
+							// create default journey row
+							await supabase.from("user_journey").upsert({ user_id: session.user.id, current_step: 1 });
+							setCurrentStep(1);
+						}
+					} catch (e) {
+						console.error(e);
+					}
 				})();
 			} else {
 				setUserId(null);
+				setProfileName(null);
 				setCurrentStep(null);
 			}
 		});
@@ -110,6 +204,78 @@ export default function Home() {
 		return null;
 	}
 
+
+	async function handleSignUp(e?: React.FormEvent) {
+		e?.preventDefault();
+		setAuthLoading(true);
+		setAuthMessage(null);
+		try {
+			// include profile fields as user_metadata so they persist through email confirmation
+			const { data, error } = await supabase.auth.signUp({
+				email: authEmail,
+				password: authPassword,
+				options: { data: { name: authName, mobile: authMobile, industry: authIndustry } },
+			});
+			if (error) {
+				setAuthMessage(error.message);
+				return;
+			}
+
+			const userId = data?.user?.id ?? null;
+			// if supabase returns a user id immediately, store profile and journey
+			if (userId) {
+				// populate `id` as well in case the profiles table expects a non-null id field
+				await supabase.from("profiles").upsert({ id: userId, user_id: userId, name: authName, mobile: authMobile, industry: authIndustry, email: authEmail });
+				await supabase.from("user_journey").upsert({ user_id: userId, current_step: 1 });
+			}
+
+			setAuthMessage("Sign up requested. Check your email to confirm (if required). If your account is active, you'll be signed in automatically.");
+			setAuthMode(null);
+			setAuthEmail("");
+			setAuthPassword("");
+			setAuthName("");
+			setAuthMobile("");
+			setAuthIndustry("");
+		} catch (err: any) {
+			setAuthMessage(String(err.message || err));
+		} finally {
+			setAuthLoading(false);
+		}
+	}
+
+	async function handleSignIn(e?: React.FormEvent) {
+		e?.preventDefault();
+		setAuthLoading(true);
+		setAuthMessage(null);
+		try {
+			const { data, error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword });
+			if (error) {
+				setAuthMessage(error.message);
+				return;
+			}
+			const user = data.user;
+			if (user) {
+				setUserId(user.id);
+				const { data: row, error: rowErr } = await supabase.from("user_journey").select("current_step").eq("user_id", user.id).maybeSingle();
+				if (!rowErr && row && row.current_step != null) setCurrentStep(Number(row.current_step));
+			}
+			setAuthMessage("Signed in successfully.");
+			setAuthMode(null);
+			setAuthEmail("");
+			setAuthPassword("");
+		} catch (err: any) {
+			setAuthMessage(String(err.message || err));
+		} finally {
+			setAuthLoading(false);
+		}
+	}
+
+	async function handleSignOut() {
+		await supabase.auth.signOut();
+		setUserId(null);
+		setCurrentStep(null);
+	}
+
 	return (
 		<main className="min-h-screen bg-gradient-to-b from-white to-zinc-50 dark:from-black dark:to-zinc-900 flex items-center justify-center p-8">
 			<div className="max-w-5xl w-full">
@@ -121,11 +287,63 @@ export default function Home() {
 					<p className="mt-4 text-lg text-zinc-600 dark:text-zinc-400">
 						A simple, guided path for novice manufacturers to prepare products and start exporting.
 					</p>
-					<div className="mt-6">
+					<div className="mt-6 flex items-center justify-center gap-4">
 						<a id="get-started" href="#journey" className="inline-block bg-blue-600 hover:bg-blue-700 text-white font-medium px-6 py-3 rounded-md shadow">
 							Get Started
 						</a>
+
+						{userId ? (
+							<button onClick={handleSignOut} className="inline-block bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-md">
+								Sign Out
+							</button>
+						) : (
+							<>
+								<button onClick={() => setAuthMode("signin")} className="inline-block bg-zinc-100 hover:bg-zinc-200 text-zinc-900 px-4 py-2 rounded-md">
+									Sign In
+								</button>
+								<button onClick={() => setAuthMode("signup")} className="inline-block bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded-md">
+									Sign Up
+								</button>
+							</>
+						)}
 					</div>
+
+					{/* Auth form (simple inline modal) */}
+					{authMode && (
+						<div className="mt-6 flex justify-center">
+							<form onSubmit={authMode === "signup" ? handleSignUp : handleSignIn} className="w-full max-w-md bg-white dark:bg-zinc-900 border rounded-lg p-4 shadow">
+								<h4 className="text-lg font-medium mb-2">{authMode === "signup" ? "Create an account" : "Sign in"}</h4>
+
+								{authMessage && <div className="text-sm text-zinc-700 dark:text-zinc-200 mb-2">{authMessage}</div>}
+
+								{authMode === "signup" && (
+									<>
+										<label className="block text-sm mb-1">Name</label>
+										<input value={authName} onChange={(e) => setAuthName(e.target.value)} type="text" required className="w-full mb-2 px-3 py-2 border rounded bg-zinc-50 dark:bg-zinc-800" />
+										<label className="block text-sm mb-1">Mobile number</label>
+										<input value={authMobile} onChange={(e) => setAuthMobile(e.target.value)} type="tel" required className="w-full mb-2 px-3 py-2 border rounded bg-zinc-50 dark:bg-zinc-800" />
+										<label className="block text-sm mb-1">Industry</label>
+										<input value={authIndustry} onChange={(e) => setAuthIndustry(e.target.value)} type="text" required className="w-full mb-2 px-3 py-2 border rounded bg-zinc-50 dark:bg-zinc-800" />
+									</>
+								)}
+
+								<label className="block text-sm mb-1">Email</label>
+								<input value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} type="email" required className="w-full mb-2 px-3 py-2 border rounded bg-zinc-50 dark:bg-zinc-800" />
+
+								<label className="block text-sm mb-1">Password</label>
+								<input value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} type="password" required className="w-full mb-3 px-3 py-2 border rounded bg-zinc-50 dark:bg-zinc-800" />
+
+								<div className="flex items-center justify-between">
+									<button type="submit" disabled={authLoading} className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded">
+										{authLoading ? "Processing..." : authMode === "signup" ? "Sign Up" : "Sign In"}
+									</button>
+									<button type="button" onClick={() => { setAuthMode(null); setAuthMessage(null); }} className="text-sm text-zinc-600 hover:underline">
+										Cancel
+									</button>
+								</div>
+							</form>
+						</div>
+					)}
 				</header>
 
 				{/* Journey Tracker */}
@@ -135,7 +353,7 @@ export default function Home() {
 							Journey Tracker
 						</h2>
 						<div className="text-sm text-zinc-600 dark:text-zinc-400">
-							{loading ? "Loading..." : userId ? `User: ${userId}` : "Not signed in"}
+							{loading ? "Loading..." : userId ? `User: ${profileName ?? userId}` : "Not signed in"}
 						</div>
 					</div>
 
