@@ -505,17 +505,25 @@ export default function Home() {
 						{STEPS.map((step) => {
 							const completed = currentStep != null && step.id < currentStep;
 							const current = currentStep === step.id;
+							const isOpportunityDiscovery = step.id === 1;
 							const isCompanySetup = step.id === 2;
 							return (
 								<li
 									key={step.id}
-									className={`flex flex-col gap-3 p-4 rounded-lg border ${current ? "border-blue-300 bg-blue-50/40" : "border-zinc-200 dark:border-zinc-800"} ${isCompanySetup ? "relative" : ""}`}
+									className={`flex flex-col gap-3 p-4 rounded-lg border ${current ? "border-blue-300 bg-blue-50/40" : "border-zinc-200 dark:border-zinc-800"} ${isCompanySetup || isOpportunityDiscovery ? "relative" : ""}`}
 								>
+									{isOpportunityDiscovery && (
+										<Link
+											href="/opportunities"
+											aria-label="Exploring opportunities — open dashboard"
+											className="absolute inset-0 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 bg-transparent z-10"
+										/>
+									)}
 									{isCompanySetup && (
 										<Link
 											href="/company-setup"
 											aria-label="Company Setup"
-											className="absolute inset-0 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 bg-transparent"
+											className="absolute inset-0 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 bg-transparent z-10"
 										/>
 									)}
 									<div className="flex items-center gap-3 justify-between">

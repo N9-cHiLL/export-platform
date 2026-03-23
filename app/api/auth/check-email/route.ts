@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
-// Server-side email-existence check to show a clear signup warning.
+// Server-side email-existence check via GoTrue Admin API (not PostgREST — auth schema is not exposed).
 // Note: This enables email enumeration. Only use for development/MVP.
 export const runtime = "nodejs";
 
@@ -16,66 +16,62 @@ export async function POST(req: Request) {
 
     const normalizedEmail = email.trim().toLowerCase();
 
-    if (!process.env.SUPABASE_SERVICE_ROLE_KEY || !process.env.NEXT_PUBLIC_SUPABASE_URL) {
+    const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+    const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+    if (!serviceKey || !supabaseUrl) {
       return NextResponse.json(
         { error: "server misconfigured: missing Supabase env vars" },
         { status: 500 }
       );
     }
 
-    const supabaseAdmin = createClient(process.env.NEXT_PUBLIC_SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+    const base = supabaseUrl.replace(/\/$/, "");
+    // GoTrue admin: filter by email (see Supabase/GoTrue admin API docs).
+    const adminUrl = `${base}/auth/v1/admin/users?filter=${encodeURIComponent(normalizedEmail)}&per_page=1&page=1`;
 
-    console.log("[check-email] checking existence for:", normalizedEmail);
+    const res = await fetch(adminUrl, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${serviceKey}`,
+        apikey: serviceKey,
+        "Content-Type": "application/json",
+      },
+    });
 
-    // Query auth.users with service role. We only need existence (not the user record).
-    // Prefer schema-qualified query: auth schema -> users table.
-    let exists = false;
-    let queryError: string | null = null;
-
-    try {
-      const primary = await supabaseAdmin
-        .schema("auth")
-        .from("users")
-        .select("id")
-        .eq("email", normalizedEmail)
-        .limit(1);
-
-      if (primary.error) {
-        console.error("[check-email] primary query error:", primary.error.message);
-        queryError = primary.error.message;
-      } else {
-        exists = (primary.data?.length ?? 0) > 0;
-      }
-    } catch (e: any) {
-      console.error("[check-email] primary query exception:", String(e?.message || e));
-      queryError = String(e?.message || e);
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      console.error("[check-email] admin users HTTP", res.status, text);
+      return NextResponse.json(
+        { exists: false, error: `Auth admin request failed (${res.status})` },
+        { status: 200 }
+      );
     }
 
-    if (!exists && queryError) {
-      // Fallback: sometimes supabase clients may allow dotted table naming.
+    const json = (await res.json()) as { users?: unknown[] };
+    const users = Array.isArray(json?.users) ? json.users : [];
+    let exists = users.length > 0;
+
+    // Fallback: your app stores email on `public.profiles` — catches accounts even if admin filter differs.
+    if (!exists) {
       try {
-        const fallback = await supabaseAdmin
-          .from("auth.users")
-          .select("id")
+        const supabase = createClient(supabaseUrl, serviceKey);
+        const { data: rows, error: profErr } = await supabase
+          .from("profiles")
+          .select("email")
           .eq("email", normalizedEmail)
           .limit(1);
-
-        if (fallback.error) {
-          console.error("[check-email] fallback query error:", fallback.error.message);
-          queryError = queryError ?? fallback.error.message;
-        } else {
-          exists = (fallback.data?.length ?? 0) > 0;
-        }
-      } catch (e: any) {
-        console.error("[check-email] fallback query exception:", String(e?.message || e));
-        queryError = queryError ?? String(e?.message || e);
+        if (!profErr && rows && rows.length > 0) exists = true;
+      } catch {
+        // ignore
       }
     }
 
-    console.log("[check-email] exists:", exists);
-    return NextResponse.json({ exists, error: queryError });
-  } catch (e: any) {
-    return NextResponse.json({ error: String(e?.message || e) }, { status: 500 });
+    console.log("[check-email] exists:", exists, "for", normalizedEmail);
+    return NextResponse.json({ exists, error: null });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error("[check-email] exception:", msg);
+    return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
-
