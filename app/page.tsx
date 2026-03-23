@@ -2,6 +2,7 @@
 "use client";
 
 import React, { useEffect, useState } from "react";
+import Link from "next/link";
 import { supabase } from "../src/lib/supabase";
 
 type Step = {
@@ -33,11 +34,28 @@ export default function Home() {
 	const [authIndustry, setAuthIndustry] = useState("");
 	const [authLoading, setAuthLoading] = useState(false);
 	const [authMessage, setAuthMessage] = useState<string | null>(null);
+	const [authMessageType, setAuthMessageType] = useState<"error" | "success" | "info">("info");
+
+	function normalizeAuthError(message: string) {
+		const lower = message.toLowerCase();
+		if (
+			lower.includes("already registered") ||
+			lower.includes("already exists") ||
+			lower.includes("already used") ||
+			lower.includes("user already registered") ||
+			(lower.includes("duplicate") && lower.includes("email")) ||
+			(lower.includes("unique") && lower.includes("email"))
+		) {
+			return "That email is already in use. Please sign in instead.";
+		}
+		return message;
+	}
 
 	useEffect(() => {
 		let mounted = true;
 		async function load() {
 			setLoading(true);
+			setError(null);
 			try {
 				const {
 					data: { user },
@@ -57,24 +75,26 @@ export default function Home() {
 
 				// fetch profile name for display
 				try {
-					const { data: profile } = await supabase.from("profiles").select("name").eq("user_id", user.id).maybeSingle();
-					if (mounted && profile && profile.name) setProfileName(profile.name);
+					const { data: profileRows } = await supabase
+						.from("profiles")
+						.select("name")
+						.eq("user_id", user.id)
+						.limit(1);
+
+					const profile = profileRows?.[0] ?? null;
+					if (mounted && profile?.name) setProfileName(profile.name);
 				} catch (e) {
 					console.error("failed to fetch profile name", e);
 				}
 
 				// fetch current_step from user_journey table
-				const { data, error } = await supabase
-					.from("user_journey")
-					.select("current_step")
-					.eq("user_id", user.id)
-					.maybeSingle();
+				const { data: journeyRows, error } = await supabase.from("user_journey").select("current_step").eq("user_id", user.id).limit(1);
 
 				if (error) {
 					console.error("Supabase query error", error);
 					if (mounted) setError(error.message);
-				} else if (data && data.current_step != null) {
-					if (mounted) setCurrentStep(Number(data.current_step));
+				} else if (journeyRows?.[0]?.current_step != null) {
+					if (mounted) setCurrentStep(Number(journeyRows[0].current_step));
 				} else {
 					// no row yet
 					if (mounted) setCurrentStep(null);
@@ -92,26 +112,31 @@ export default function Home() {
 		// listen for auth changes (ensure profile and journey rows exist)
 		const { data: listener } = supabase.auth.onAuthStateChange(async (_event, session) => {
 			if (session?.user) {
+				setError(null);
 				setUserId(session.user.id);
 				// set profile name if exists
 				try {
-					const { data: profile, error: profileErr } = await supabase
+					const { data: profileRows, error: profileErr } = await supabase
 						.from("profiles")
 						.select("name")
 						.eq("user_id", session.user.id)
-						.maybeSingle();
-					if (!profileErr && profile && profile.name) setProfileName(profile.name);
+						.limit(1);
+
+					const profile = profileRows?.[0] ?? null;
+					if (!profileErr && profile?.name) setProfileName(profile.name);
 				} catch (e) {
 					console.error(e);
 				}
 				// ensure profile and user_journey rows exist and fetch current_step
 				(async () => {
 					try {
-						const { data: profile, error: profileErr } = await supabase
+						const { data: profileRows, error: profileErr } = await supabase
 							.from("profiles")
 							.select("*")
 							.eq("user_id", session.user.id)
-							.maybeSingle();
+							.limit(1);
+
+						const profile = profileRows?.[0] ?? null;
 
 						if (profileErr) console.error("profile fetch error", profileErr);
 
@@ -158,12 +183,13 @@ export default function Home() {
 							}
 						}
 
-						const { data, error } = await supabase
+						const { data: journeyRows, error } = await supabase
 							.from("user_journey")
 							.select("current_step")
 							.eq("user_id", session.user.id)
-							.maybeSingle();
-						if (!error && data && data.current_step != null) setCurrentStep(Number(data.current_step));
+							.limit(1);
+
+						if (!error && journeyRows?.[0]?.current_step != null) setCurrentStep(Number(journeyRows[0].current_step));
 						else {
 							// create default journey row
 							await supabase.from("user_journey").upsert({ user_id: session.user.id, current_step: 1 });
@@ -209,7 +235,40 @@ export default function Home() {
 		e?.preventDefault();
 		setAuthLoading(true);
 		setAuthMessage(null);
+		setAuthMessageType("info");
 		try {
+			// Check email existence server-side so we can warn immediately on the signup form.
+			// (Without this, Supabase can respond with a generic success message even when the email exists.)
+			const checkRes = await fetch("/api/auth/check-email", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ email: authEmail.trim().toLowerCase() }),
+			});
+			if (!checkRes.ok) {
+				// Fail closed: if we can't verify, don't send the generic signup success.
+				let serverErr = "";
+				try {
+					serverErr = (await checkRes.json())?.error ?? "";
+				} catch {
+					// ignore
+				}
+				setAuthMessage(serverErr ? `Could not verify email: ${serverErr}` : "Could not verify email at this time.");
+				setAuthMessageType("error");
+				return;
+			}
+
+			const checkJson = (await checkRes.json()) as { exists?: boolean };
+			if (checkJson && (checkJson as any).error) {
+				setAuthMessage(`Could not verify email: ${(checkJson as any).error}`);
+				setAuthMessageType("error");
+				return;
+			}
+			if (checkJson?.exists) {
+				setAuthMessage("That email is already in use. Please sign in instead.");
+				setAuthMessageType("error");
+				return;
+			}
+
 			// include profile fields as user_metadata so they persist through email confirmation
 			const { data, error } = await supabase.auth.signUp({
 				email: authEmail,
@@ -217,19 +276,65 @@ export default function Home() {
 				options: { data: { name: authName, mobile: authMobile, industry: authIndustry } },
 			});
 			if (error) {
-				setAuthMessage(error.message);
+				setAuthMessage(normalizeAuthError(error.message));
+				setAuthMessageType("error");
 				return;
 			}
 
 			const userId = data?.user?.id ?? null;
 			// if supabase returns a user id immediately, store profile and journey
 			if (userId) {
-				// populate `id` as well in case the profiles table expects a non-null id field
+				// Supabase may not always throw a hard "already registered" error.
+				// When it signs in an existing user, `created_at` will be older than a brand-new signup.
+				const createdAtRaw = (data.user as any)?.created_at as string | undefined;
+				let likelyDuplicate = false;
+				if (createdAtRaw) {
+					const createdAt = new Date(createdAtRaw).getTime();
+					if (!Number.isNaN(createdAt)) {
+						// If the user existed before "just now", treat it as duplicate email.
+						likelyDuplicate = Date.now() - createdAt > 2 * 60 * 1000;
+					}
+				}
+
+				if (likelyDuplicate) {
+					setAuthMessage("That email is already in use. Please sign in instead.");
+					setAuthMessageType("error");
+					return;
+				}
+
+				// If the email already existed, Supabase may sign the user in immediately.
+				// Detect that case so we can show a warning instead of silently navigating away.
+				const { data: existingProfilesRows } = await supabase
+					.from("profiles")
+					.select("user_id")
+					.eq("user_id", userId)
+					.limit(1);
+
+				const { data: existingJourneyRows } = await supabase
+					.from("user_journey")
+					.select("user_id")
+					.eq("user_id", userId)
+					.limit(1);
+
+				const alreadyHasProfile = (existingProfilesRows?.length ?? 0) > 0;
+				const alreadyHasJourney = (existingJourneyRows?.length ?? 0) > 0;
+				const alreadyAccount = alreadyHasProfile || alreadyHasJourney;
+
+				if (alreadyAccount) {
+					setAuthMessage("That email is already in use. You're signed in.");
+					setAuthMessageType("error");
+					return;
+				}
+
+				// New user: populate `id` as well in case the profiles table expects a non-null id field.
 				await supabase.from("profiles").upsert({ id: userId, user_id: userId, name: authName, mobile: authMobile, industry: authIndustry, email: authEmail });
 				await supabase.from("user_journey").upsert({ user_id: userId, current_step: 1 });
 			}
 
-			setAuthMessage("Sign up requested. Check your email to confirm (if required). If your account is active, you'll be signed in automatically.");
+			setAuthMessage(
+				"Sign up requested. Check your email to confirm (if required). If your account is active, you'll be signed in automatically."
+			);
+			setAuthMessageType("success");
 			setAuthMode(null);
 			setAuthEmail("");
 			setAuthPassword("");
@@ -237,7 +342,9 @@ export default function Home() {
 			setAuthMobile("");
 			setAuthIndustry("");
 		} catch (err: any) {
-			setAuthMessage(String(err.message || err));
+			const msg = String(err.message || err);
+			setAuthMessage(normalizeAuthError(msg));
+			setAuthMessageType("error");
 		} finally {
 			setAuthLoading(false);
 		}
@@ -247,24 +354,33 @@ export default function Home() {
 		e?.preventDefault();
 		setAuthLoading(true);
 		setAuthMessage(null);
+		setAuthMessageType("info");
 		try {
 			const { data, error } = await supabase.auth.signInWithPassword({ email: authEmail, password: authPassword });
 			if (error) {
-				setAuthMessage(error.message);
+				setAuthMessage(normalizeAuthError(error.message));
+				setAuthMessageType("error");
 				return;
 			}
 			const user = data.user;
 			if (user) {
 				setUserId(user.id);
-				const { data: row, error: rowErr } = await supabase.from("user_journey").select("current_step").eq("user_id", user.id).maybeSingle();
-				if (!rowErr && row && row.current_step != null) setCurrentStep(Number(row.current_step));
+				const { data: rowRows, error: rowErr } = await supabase
+					.from("user_journey")
+					.select("current_step")
+					.eq("user_id", user.id)
+					.limit(1);
+				if (!rowErr && rowRows?.[0]?.current_step != null) setCurrentStep(Number(rowRows[0].current_step));
 			}
 			setAuthMessage("Signed in successfully.");
+			setAuthMessageType("success");
 			setAuthMode(null);
 			setAuthEmail("");
 			setAuthPassword("");
 		} catch (err: any) {
-			setAuthMessage(String(err.message || err));
+			const msg = String(err.message || err);
+			setAuthMessage(normalizeAuthError(msg));
+			setAuthMessageType("error");
 		} finally {
 			setAuthLoading(false);
 		}
@@ -314,7 +430,19 @@ export default function Home() {
 							<form onSubmit={authMode === "signup" ? handleSignUp : handleSignIn} className="w-full max-w-md bg-white dark:bg-zinc-900 border rounded-lg p-4 shadow">
 								<h4 className="text-lg font-medium mb-2">{authMode === "signup" ? "Create an account" : "Sign in"}</h4>
 
-								{authMessage && <div className="text-sm text-zinc-700 dark:text-zinc-200 mb-2">{authMessage}</div>}
+								{authMessage && (
+									<div
+										className={`text-sm mb-2 ${
+											authMessageType === "error"
+												? "text-red-600 dark:text-red-400"
+												: authMessageType === "success"
+												? "text-green-700 dark:text-green-300"
+												: "text-zinc-700 dark:text-zinc-200"
+										}`}
+									>
+										{authMessage}
+									</div>
+								)}
 
 								{authMode === "signup" && (
 									<>
@@ -337,7 +465,15 @@ export default function Home() {
 									<button type="submit" disabled={authLoading} className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded">
 										{authLoading ? "Processing..." : authMode === "signup" ? "Sign Up" : "Sign In"}
 									</button>
-									<button type="button" onClick={() => { setAuthMode(null); setAuthMessage(null); }} className="text-sm text-zinc-600 hover:underline">
+									<button
+										type="button"
+										onClick={() => {
+											setAuthMode(null);
+											setAuthMessage(null);
+											setAuthMessageType("info");
+										}}
+										className="text-sm text-zinc-600 hover:underline"
+									>
 										Cancel
 									</button>
 								</div>
@@ -359,12 +495,29 @@ export default function Home() {
 
 					{error && <div className="text-sm text-red-600 mb-4">Error: {error}</div>}
 
+					{!authMode && authMessage && (
+						<div className={`text-sm mb-4 ${authMessageType === "error" ? "text-red-600" : authMessageType === "success" ? "text-green-700" : "text-zinc-700"}`}>
+							{authMessage}
+						</div>
+					)}
+
 					<ol className="grid grid-cols-1 sm:grid-cols-4 gap-4">
 						{STEPS.map((step) => {
 							const completed = currentStep != null && step.id < currentStep;
 							const current = currentStep === step.id;
+							const isCompanySetup = step.id === 2;
 							return (
-								<li key={step.id} className={`flex flex-col gap-3 p-4 rounded-lg border ${current ? "border-blue-300 bg-blue-50/40" : "border-zinc-200 dark:border-zinc-800"}`}>
+								<li
+									key={step.id}
+									className={`flex flex-col gap-3 p-4 rounded-lg border ${current ? "border-blue-300 bg-blue-50/40" : "border-zinc-200 dark:border-zinc-800"} ${isCompanySetup ? "relative" : ""}`}
+								>
+									{isCompanySetup && (
+										<Link
+											href="/company-setup"
+											aria-label="Company Setup"
+											className="absolute inset-0 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 bg-transparent"
+										/>
+									)}
 									<div className="flex items-center gap-3 justify-between">
 										<div className="flex items-center gap-3">
 											<div className={`w-8 h-8 rounded-full flex items-center justify-center font-semibold ${completed ? "bg-green-600 text-white" : current ? "bg-blue-600 text-white" : "bg-zinc-200 text-zinc-800 dark:bg-zinc-700 dark:text-zinc-100"}`}>
