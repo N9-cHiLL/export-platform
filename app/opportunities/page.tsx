@@ -238,6 +238,7 @@ export default function OpportunitiesPage() {
 								type="button"
 								role="tab"
 								aria-selected={selected}
+								title={item.description}
 								id={`tab-${item.id}`}
 								aria-controls={`panel-${item.id}`}
 								onClick={() => setTab(item.id)}
